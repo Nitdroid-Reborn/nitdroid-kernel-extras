@@ -1,0 +1,92 @@
+#ifndef __PVR_CONFIG_H__
+#define __PVR_CONFIG_H__
+
+#include "pvr_cleanup.h"
+
+
+/*** CONFIG SECTION ***/
+
+/*#define CONFIG_SGX_BUILD_DEBUG*/
+#define CONFIG_SGX_EDM_TRACING
+#define CONFIG_SGX_MK_TRACE
+#define CONFIG_PVR_OMAP_DSS2
+#define CONFIG_PVR_OMAP_USE_VSYNC
+#define CONFIG_PVR_APM
+
+/*** CONFIG SECTION ENDS ***/
+
+
+#define LINUX
+#define ANDROID
+
+#define SUPPORT_SRVINIT
+#define SUPPORT_HW_RECOVERY
+#define SUPPORT_PERCONTEXT_PB
+#define SUPPORT_SGX_EVENT_OBJECT
+#define SUPPORT_SGX_HWPERF
+#define SUPPORT_SGX_LOW_LATENCY_SCHEDULING
+#define SUPPORT_CPU_CACHED_BUFFERS
+#define SUPPORT_CACHEFLUSH_ON_ALLOC
+#define SUPPORT_MEMINFO_IDS
+
+#define SYS_CUSTOM_POWERLOCK_WRAP
+#define SYS_USING_INTERRUPTS
+
+#define PVR_PROC_USE_SEQ_FILE
+#define PVR_SECURE_HANDLES
+#define PVR_SECURE_FD_EXPORT
+#define PVR_LINUX_MISR_USING_WORKQUEUE
+
+#define SERVICES4
+#define TRANSFER_QUEUE
+#define PVR2D_VALIDATE_INPUT_PARAMS
+#define LDM_PLATFORM
+#define PVR2D_ALT_2DHW
+
+#define SGX_DYNAMIC_TIMING_INFO
+
+#define SYS_SGX_ACTIVE_POWER_LATENCY_MS	100
+
+#define SGX530
+#define SUPPORT_SGX
+#define SUPPORT_SGX530
+#define SGX_CORE_REV 		121
+
+#define DISPLAY_CONTROLLER	omaplfb
+
+
+#ifdef CONFIG_PVR_APM
+# define SUPPORT_ACTIVE_POWER_MANAGEMENT
+#endif
+
+#ifdef CONFIG_SGX_EDM_TRACING
+# define PVRSRV_USSE_EDM_STATUS_DEBUG
+#endif
+
+#ifdef CONFIG_SGX_MK_TRACE
+# define PVRSRV_DUMP_MK_TRACE
+#endif
+
+#ifdef CONFIG_SGX_BUILD_DEBUG
+# define PVR_BUILD_TYPE "debug"
+# define DEBUG
+# define DEBUG_LINUX_MEMORY_ALLOCATIONS
+# define DEBUG_LINUX_MEM_AREAS
+# define DEBUG_LINUX_MMAP_AREAS
+# define DEBUG_BRIDGE_KM
+# define DLL_METRIC 1
+#else
+# define PVR_BUILD_TYPE  "release"
+# define RELEASE
+#endif
+
+
+#ifndef __linux__
+# define __linux__
+#endif
+
+#ifndef LINUX
+# define LINUX
+#endif
+
+#endif /* __CONFIG_H__ */
