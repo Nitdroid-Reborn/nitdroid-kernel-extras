@@ -24,20 +24,37 @@
  *
  ******************************************************************************/
 
-#include <asm/io.h>
-#include <asm/uaccess.h>
+#ifndef AUTOCONF_INCLUDED
+#include <linux/config.h>
+#endif
 
 #include <linux/version.h>
 #include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/slab.h>
-#include <linux/errno.h>
-#include <linux/interrupt.h>
-#include <linux/delay.h>
-#include <linux/fb.h>
-#include <linux/platform_device.h>
 
-#include "display.h"
+#include <linux/fb.h>
+#include <linux/omapfb.h>
+
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(2,6,29))
+#include <plat/vrfb.h>
+#else
+#include <mach/vrfb.h>
+#endif
+#include <../drivers/video/omap2/omapfb/omapfb.h>
+
+#if defined(LDM_PLATFORM)
+#include <linux/platform_device.h>
+#endif 
+
+#include <asm/io.h>
+
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(2,6,29))
+#include <plat/display.h>
+#elif (LINUX_VERSION_CODE > KERNEL_VERSION(2,6,26))
+#include <mach/display.h>
+#else 
+#include <asm/arch-omap/display.h>
+#endif 
+
 #include "img_defs.h"
 #include "servicesext.h"
 #include "kerneldisplay.h"
@@ -47,6 +64,8 @@
 MODULE_SUPPORTED_DEVICE(DEVNAME);
 
 #define unref__ __attribute__ ((unused))
+
+static struct omap_overlay_manager* lcd_mgr = 0;
 
 void *OMAPLFBAllocKernelMem(unsigned long ulSize)
 {
@@ -72,128 +91,73 @@ OMAP_ERROR OMAPLFBGetLibFuncAddr (char *szFunctionName, PFN_DC_GET_PVRJTABLE *pp
 	return (OMAP_OK);
 }
 
-static struct omap_overlay_manager* lcd_mgr = 0;
-#ifdef CONFIG_TVOUT_SHOLEST
-static struct omap_overlay_manager* tv_mgr = 0;
-#endif
-static struct omap_overlay*         omap_gfxoverlay = 0;
-#ifdef CONFIG_TVOUT_SHOLEST
-static struct omap_overlay*         omap_vid2overlay = 0;
-#endif
-static struct omap_overlay_info     gfxoverlayinfo;
-#ifdef CONFIG_TVOUT_SHOLEST
-static struct omap_overlay_info     vid2overlayinfo;
-#endif
-struct fb_info *fb_info;
-
-void OMAPLFBDisplayInit(void)
-{
-    struct omap_overlay*         overlayptr = 0;
-    unsigned int                 i = 0;
-    unsigned int                 numoverlays = 0;
-
-    // there is tv and lcd managers... we only care about lcd at this time.
+static void GetLcdManager(void){
     lcd_mgr = omap_dss_get_overlay_manager(OMAP_DSS_OVL_MGR_LCD);
-#ifdef CONFIG_TVOUT_SHOLEST
-    tv_mgr = omap_dss_get_overlay_manager(OMAP_DSS_OVL_MGR_TV);
-#endif
     if(!lcd_mgr)
     {
-        DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBSetDisplayInfo couldn't find lcd overlay manager\n"));
-        return;
+    	DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": GetLcdManager couldn't find lcd overlay manager\n"));
     }
-
-    numoverlays = omap_dss_get_num_overlays();
-    if( numoverlays == 0)
-    {
-        DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBSetDisplayInfo couldn't find any overlays\n"));
-        return;
-    }
-
-    for( i = 0; i < numoverlays; i++ )
-    {
-        overlayptr = omap_dss_get_overlay(i);
-        if( strncmp( overlayptr->name, "gfx", 3 ) == 0)
-        {
-            DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBSetDisplayInfo found GFX overlay\n"));
-            omap_gfxoverlay = overlayptr;
-            break;
-        }
-    }
-#ifdef CONFIG_TVOUT_SHOLEST
-        for( i = 0; i < numoverlays; i++ )
-        {
-            overlayptr = omap_dss_get_overlay(i);
-            if( strncmp( overlayptr->name, "vid2", 4 ) == 0)
-            {
-                DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBSetDisplayInfo found GFX overlay\n"));
-                omap_vid2overlay = overlayptr;
-                break;
-            }
-        }
-
-#endif
-    if( omap_gfxoverlay == 0 )
-    {
-        DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBSetDisplayInfo GFX overlay no found\n"));
-        return;
-    }
-
-    omap_gfxoverlay->get_overlay_info( omap_gfxoverlay, &gfxoverlayinfo );
-#ifdef CONFIG_TVOUT_SHOLEST
-    omap_vid2overlay->get_overlay_info(omap_vid2overlay, &vid2overlayinfo);
-#endif
-    fb_info =  registered_fb[0];
 
 }
 
-void OMAPLFBSync(void)
+
+void OMAPLFBFlip(OMAPLFB_SWAPCHAIN *psSwapChain, unsigned long aPhyAddr)
 {
-	if (lcd_mgr && lcd_mgr->device && omap_gfxoverlay && lcd_mgr->device->sync)
-		lcd_mgr->device->sync(lcd_mgr->device);
-}
+struct omap_overlay* overlay;
+	struct omap_overlay_info overlay_info;
+	struct fb_info * framebuffer;
+	OMAPLFB_DEVINFO	*psDevInfo;
+	struct omapfb_info *ofbi;
+	struct omapfb2_device *fbdev;
+	int i;
+	unsigned long fb_offset;
 
-void OMAPLFBFlip(OMAPLFB_SWAPCHAIN *psSwapChain, unsigned long paddr)
-{
-	u32 pixels;
+	psDevInfo = (OMAPLFB_DEVINFO *) psSwapChain->pvDevInfo;
+	framebuffer = psDevInfo->psLINFBInfo;
+	ofbi = FB2OFB(framebuffer);
+	fb_offset = aPhyAddr - psDevInfo->sSystemBuffer.sSysAddr.uiAddr;
+	fbdev = ofbi->fbdev;
 
-	if (lcd_mgr && lcd_mgr->device && omap_gfxoverlay) {
-		omap_gfxoverlay->get_overlay_info(omap_gfxoverlay,
-						  &gfxoverlayinfo);
-		gfxoverlayinfo.paddr = paddr;
-		/* TODO: plumb vaddr in to this function */
-		gfxoverlayinfo.vaddr = (void *)(paddr - 0x81314000 + 0xd2800000);
+	omapfb_lock(fbdev);
 
-		omap_gfxoverlay->set_overlay_info(omap_gfxoverlay,
-						  &gfxoverlayinfo);
-		lcd_mgr->apply(lcd_mgr);
+	for(i = 0; i < ofbi->num_overlays ; i++)
+	{
+		overlay = ofbi->overlays[i];
+		overlay->get_overlay_info( overlay, &overlay_info );
+		/* If the overlay is not enabled don't update it */
+		if(!overlay_info.enabled)
+			continue;
 
-#ifdef CONFIG_TVOUT_SHOLEST
-		omap_vid2overlay->get_overlay_info(omap_vid2overlay,
-						  &vid2overlayinfo);
-		if(vid2overlayinfo.enabled ==1){
-			vid2overlayinfo.paddr = paddr;
-			/* TODO: plumb vaddr in to this function */
-			vid2overlayinfo.vaddr = (void *)paddr - 0x81314000 + 0xd2800000;
+		overlay_info.paddr = framebuffer->fix.smem_start + fb_offset;
+		overlay_info.vaddr = framebuffer->screen_base + fb_offset;
+		overlay->set_overlay_info(overlay, &overlay_info);
+		overlay->manager->apply(overlay->manager);
 
-			omap_vid2overlay->set_overlay_info(omap_vid2overlay,
-						  &vid2overlayinfo);
-			tv_mgr->apply(tv_mgr);
+		if(overlay->manager->display->update)
+		{
+			overlay->manager->display->update(
+				overlay->manager->display, 0, 0,
+				overlay_info.width,
+				overlay_info.height);
 		}
-#endif
-		if (lcd_mgr->device->update)
-			lcd_mgr->device->update(lcd_mgr->device, 0, 0,
-						gfxoverlayinfo.width,
-						gfxoverlayinfo.height);
-
-		pixels = (paddr - fb_info->fix.smem_start) /
-			(fb_info->var.bits_per_pixel / 8);
-		fb_info->var.yoffset = pixels / fb_info->var.xres;
-		fb_info->var.xoffset = pixels % fb_info->var.xres;
 	}
+
+	omapfb_unlock(fbdev);
+
 }
 
-static OMAP_BOOL bDeviceSuspended;
+void OMAPLFBWaitForVSync(void)
+{
+	if (lcd_mgr && lcd_mgr->display)	
+		lcd_mgr->display->wait_vsync(lcd_mgr->display);
+}
+
+
+#if defined(LDM_PLATFORM)
+
+static volatile OMAP_BOOL bDeviceSuspended;
+
+#if !defined(SGX_EARLYSUSPEND)
 
 static void OMAPLFBCommonSuspend(void)
 {
@@ -205,18 +169,6 @@ static void OMAPLFBCommonSuspend(void)
 	OMAPLFBDriverSuspend();
 
 	bDeviceSuspended = OMAP_TRUE;
-}
-
-static int OMAPLFBDriverProbe_Entry(struct platform_device *pdev)
-{
-	dev_dbg(&pdev->dev, "probe\n");
-	if(OMAPLFBInit() != OMAP_OK)
-	{
-		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: OMAPLFBInit failed\n");
-		return -ENODEV;
-	}
-
-	return 0;
 }
 
 static int OMAPLFBDriverSuspend_Entry(struct platform_device unref__ *pDevice, pm_message_t unref__ state)
@@ -246,44 +198,160 @@ static IMG_VOID OMAPLFBDriverShutdown_Entry(struct platform_device unref__ *pDev
 	OMAPLFBCommonSuspend();
 }
 
-static int __exit OMAPLFBDriverRemove_Entry(struct platform_device *pdev)
+#else /* !defined(SGX_EARLYSUSPEND) */
+static void OMAPLFBCommonSuspend(void)
 {
-	if(OMAPLFBDeinit() != OMAP_OK)
+
+	if (bDeviceSuspended)
 	{
-		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: OMAPLFBDeinit failed\n");
+		return;
 	}
-	return 0;
+
+	OMAPLFBDriverSuspend();
+
+	bDeviceSuspended = OMAP_TRUE;
+
 }
+
+static void OMAPLFBDriverSuspend_Entry(struct early_suspend *h)
+{
+	DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBDriverSuspend_Entry\n"));
+
+	printk(KERN_WARNING DRIVER_PREFIX ": **** SUSPEND\n");
+	
+	OMAPLFBCommonSuspend();
+
+}
+
+static void OMAPLFBDriverResume_Entry(struct early_suspend *h)
+{
+	DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBDriverResume_Entry\n"));
+
+	printk(KERN_WARNING DRIVER_PREFIX ": **** RESUME\n");	
+
+	OMAPLFBDriverResume();	
+
+	bDeviceSuspended = OMAP_FALSE;
+
+}
+#endif /* !defined(SGX_EARLYSUSPEND) */
 
 static struct platform_driver omaplfb_driver = {
 	.driver = {
 		.name		= DRVNAME,
 	},
-	.probe		= OMAPLFBDriverProbe_Entry,
- 	.suspend	= OMAPLFBDriverSuspend_Entry,
+#if !defined(SGX_EARLYSUSPEND)
+	.suspend	= OMAPLFBDriverSuspend_Entry,
 	.resume		= OMAPLFBDriverResume_Entry,
 	.shutdown	= OMAPLFBDriverShutdown_Entry,
-	.remove		= __exit_p(OMAPLFBDriverRemove_Entry),
-
+#endif
 };
+
+#if defined(MODULE)
+
+static void OMAPLFBDeviceRelease_Entry(struct device unref__ *pDevice)
+{
+	DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFBDriverRelease_Entry\n"));
+
+	OMAPLFBCommonSuspend();
+}
+
+static struct platform_device omaplfb_device = {
+	.name			= DEVNAME,
+	.id				= -1,
+	.dev 			= {
+		.release		= OMAPLFBDeviceRelease_Entry
+	}
+};
+
+#endif /* defined(MODULE) */  
+
+#endif	/* defined(LDM_PLATFORM) */
+
+#if defined(SGX_EARLYSUSPEND)
+	OMAPLFB_DEVINFO *psDevInfo;
+#endif	
 
 static int __init OMAPLFB_Init(void)
 {
+#if defined(LDM_PLATFORM)
 	int error;
+#endif
 
+	if(OMAPLFBInit() != OMAP_OK)
+	{
+		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: OMAPLFBInit failed\n");
+		return -ENODEV;
+	}
+
+	/* Get the LCD manager which corresponds to the primary display*/
+	GetLcdManager();
+
+#if defined(LDM_PLATFORM)
 	if ((error = platform_driver_register(&omaplfb_driver)) != 0)
 	{
 		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: Unable to register platform driver (%d)\n", error);
 
-		return -ENODEV;
+		goto ExitDeinit;
 	}
 
+#if defined(MODULE)
+	if ((error = platform_device_register(&omaplfb_device)) != 0)
+	{
+		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: Unable to register platform device (%d)\n", error);
+
+		goto ExitDeinit;
+	}
+#endif /* defined(MODULE) */
+
+#if defined(SGX_EARLYSUSPEND)
+	psDevInfo = NULL;
+	psDevInfo = GetAnchorPtr();
+
+	if (psDevInfo == NULL)
+	{
+		DEBUG_PRINTK((KERN_INFO DRIVER_PREFIX ": OMAPLFB_Init: Unable to get DevInfo anchor pointer\n"));
+		goto ExitDeinit;
+	}
+
+	psDevInfo->sFBInfo.early_suspend.suspend = OMAPLFBDriverSuspend_Entry;
+        psDevInfo->sFBInfo.early_suspend.resume = OMAPLFBDriverResume_Entry;
+        psDevInfo->sFBInfo.early_suspend.level = EARLY_SUSPEND_LEVEL_DISABLE_FB;
+        register_early_suspend(&psDevInfo->sFBInfo.early_suspend);
+#endif /* defined(SGX_EARLYSUSPEND) */
+
+#endif /* defined(LDM_PLATFORM) */
+
 	return 0;
+
+#if defined(LDM_PLATFORM)
+ExitDeinit:
+	platform_driver_unregister(&omaplfb_driver);
+
+#if defined(SGX_EARLYSUSPEND)
+        unregister_early_suspend(&psDevInfo->sFBInfo.early_suspend);
+#endif
+	if(OMAPLFBDeinit() != OMAP_OK)
+	{
+		printk(KERN_WARNING DRIVER_PREFIX ": OMAPLFB_Init: OMAPLFBDeinit failed\n");
+	}
+
+	return -ENODEV;
+#endif /* defined(LDM_PLATFORM) */ 
 }
 
 static IMG_VOID __exit OMAPLFB_Cleanup(IMG_VOID)
 {    
+#if defined (LDM_PLATFORM)
+#if defined (MODULE)
+	platform_device_unregister(&omaplfb_device);
+#endif
 	platform_driver_unregister(&omaplfb_driver);
+#endif /* defined (LDM_PLATFORM) */
+
+#if defined(SGX_EARLYSUSPEND)
+	unregister_early_suspend(&psDevInfo->sFBInfo.early_suspend);
+#endif
 
 	if(OMAPLFBDeinit() != OMAP_OK)
 	{
@@ -291,5 +359,6 @@ static IMG_VOID __exit OMAPLFB_Cleanup(IMG_VOID)
 	}
 }
 
-late_initcall(OMAPLFB_Init);
+module_init(OMAPLFB_Init);
 module_exit(OMAPLFB_Cleanup);
+

@@ -31,7 +31,6 @@
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/notifier.h>
-#include <linux/spinlock.h>
 
 #include "img_defs.h"
 #include "servicesext.h"
@@ -45,8 +44,9 @@ static int fb_idx = 0;
 #define OMAPLFB_COMMAND_COUNT		1
 
 static PFN_DC_GET_PVRJTABLE pfnGetPVRJTable = 0;
+static void OMAPLFBVSyncIHandler(struct work_struct*);
 
-static OMAPLFB_DEVINFO * GetAnchorPtr(void)
+OMAPLFB_DEVINFO * GetAnchorPtr(void)
 {
 	return (OMAPLFB_DEVINFO *)gpvAnchor;
 }
@@ -145,21 +145,17 @@ static void SetFlushStateInternalNoLock(OMAPLFB_DEVINFO* psDevInfo,
 static IMG_VOID SetFlushStateInternal(OMAPLFB_DEVINFO* psDevInfo,
                                       OMAP_BOOL bFlushState)
 {
-	unsigned long ulLockFlags;
-
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
-
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
+	
 	SetFlushStateInternalNoLock(psDevInfo, bFlushState);
 
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 }
 
 static void SetFlushStateExternal(OMAPLFB_DEVINFO* psDevInfo,
                                   OMAP_BOOL bFlushState)
 {
-	unsigned long ulLockFlags;
-
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
 
 	
 	if (psDevInfo->bFlushCommands != bFlushState)
@@ -168,7 +164,7 @@ static void SetFlushStateExternal(OMAPLFB_DEVINFO* psDevInfo,
 		SetFlushStateInternalNoLock(psDevInfo, bFlushState);
 	}
 
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 }
 
 static IMG_VOID SetDCState(IMG_HANDLE hDevice, IMG_UINT32 ui32State)
@@ -236,7 +232,7 @@ static OMAP_ERROR UnblankDisplay(OMAPLFB_DEVINFO *psDevInfo)
 	acquire_console_sem();
 	res = fb_blank(psDevInfo->psLINFBInfo, 0);
 	release_console_sem();
-	if (res != 0)
+	if (res != 0 && res != -EINVAL)
 	{
 		printk(KERN_WARNING DRIVER_PREFIX
 			": fb_blank failed (%d)", res);
@@ -483,9 +479,7 @@ static PVRSRV_ERROR CreateDCSwapChain(IMG_HANDLE hDevice,
 	OMAPLFB_VSYNC_FLIP_ITEM *psVSyncFlips;
 	IMG_UINT32 i;
 	PVRSRV_ERROR eError = PVRSRV_ERROR_GENERIC;
-	unsigned long ulLockFlags;
 	IMG_UINT32 ui32BuffersToSkip;
-
 	UNREFERENCED_PARAMETER(ui32OEMFlags);
 	UNREFERENCED_PARAMETER(pui32SwapChainID);
 	
@@ -576,8 +570,11 @@ static PVRSRV_ERROR CreateDCSwapChain(IMG_HANDLE hDevice,
 	psSwapChain->ulInsertIndex = 0;
 	psSwapChain->ulRemoveIndex = 0;
 	psSwapChain->psPVRJTable = &psDevInfo->sPVRJTable;
-	psSwapChain->psSwapChainLock = &psDevInfo->sSwapChainLock;
+	psSwapChain->pvDevInfo = (void*)psDevInfo;
 
+	/* Init the workqueue and its own work */
+	INIT_WORK(&psDevInfo->vsync_work, OMAPLFBVSyncIHandler);
+	psDevInfo->vsync_isr_wq = create_workqueue("pvr_vsync_wq");
 	
 	for(i=0; i<ui32BufferCount-1; i++)
 	{
@@ -597,18 +594,16 @@ static PVRSRV_ERROR CreateDCSwapChain(IMG_HANDLE hDevice,
 		psBuffer[i].sSysAddr.uiAddr = psDevInfo->sFBInfo.sSysAddr.uiAddr + ui32BufferOffset;
 		psBuffer[i].sCPUVAddr = psDevInfo->sFBInfo.sCPUVAddr + ui32BufferOffset;
 	}
-
 	
 	for(i=0; i<ui32BufferCount; i++)
 	{
-		INIT_LIST_HEAD(&psBuffer[i].list);
 		psVSyncFlips[i].bValid = OMAP_FALSE;
 		psVSyncFlips[i].bFlipped = OMAP_FALSE;
 		psVSyncFlips[i].bCmdCompleted = OMAP_FALSE;
 	}
-
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
 	
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
+
 	psDevInfo->psSwapChain = psSwapChain;
 	
 	psSwapChain->bFlushCommands = psDevInfo->bFlushCommands;
@@ -622,12 +617,12 @@ static PVRSRV_ERROR CreateDCSwapChain(IMG_HANDLE hDevice,
 		psSwapChain->ulSetFlushStateRefCount = 0;
 	}
 		
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 
 	if (EnableLFBEventNotification(psDevInfo)!= OMAP_OK)
 	{
 		printk(KERN_WARNING DRIVER_PREFIX ": Couldn't enable framebuffer event notification\n");
-		goto ErrorFreeVsyncFlips;
+		goto ErrorDisableDisplayRegisters;
 	}
 
 	
@@ -635,7 +630,7 @@ static PVRSRV_ERROR CreateDCSwapChain(IMG_HANDLE hDevice,
 
 	return (PVRSRV_OK);
 
-ErrorFreeVsyncFlips:
+ErrorDisableDisplayRegisters:
 	OMAPLFBFreeKernelMem(psVSyncFlips);
 ErrorFreeBuffers:
 	OMAPLFBFreeKernelMem(psBuffer);
@@ -650,7 +645,6 @@ static PVRSRV_ERROR DestroyDCSwapChain(IMG_HANDLE hDevice,
 {
 	OMAPLFB_DEVINFO	*psDevInfo;
 	OMAPLFB_SWAPCHAIN *psSwapChain;
-	unsigned long ulLockFlags;
 	OMAP_ERROR eError;
 
 	
@@ -672,18 +666,20 @@ static PVRSRV_ERROR DestroyDCSwapChain(IMG_HANDLE hDevice,
 		printk(KERN_WARNING DRIVER_PREFIX ": Couldn't disable framebuffer event notification\n");
 	}
 
-	OMAPLFBFlip(psSwapChain, (unsigned long)psDevInfo->sFBInfo.sSysAddr.uiAddr);
-	cancel_work_sync(&psDevInfo->active_work);
-	INIT_LIST_HEAD(&psDevInfo->active_list);
-
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
-
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);	
+	
 	FlushInternalVSyncQueue(psSwapChain);
-
+	
+	OMAPLFBFlip(psSwapChain, (unsigned long)psDevInfo->sFBInfo.sSysAddr.uiAddr);
+	
 	psDevInfo->psSwapChain = NULL;
+ 
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
-
+	/* Destroy the workqueue */
+	flush_workqueue(psDevInfo->vsync_isr_wq);
+	destroy_workqueue(psDevInfo->vsync_isr_wq);
+	
 	OMAPLFBFreeKernelMem(psSwapChain->psVSyncFlips);
 	OMAPLFBFreeKernelMem(psSwapChain->psBuffer);
 	OMAPLFBFreeKernelMem(psSwapChain);
@@ -811,7 +807,6 @@ static PVRSRV_ERROR SwapToDCSystem(IMG_HANDLE hDevice,
 {
 	OMAPLFB_DEVINFO   *psDevInfo;
 	OMAPLFB_SWAPCHAIN *psSwapChain;
-	unsigned long      ulLockFlags;
 
 	if(!hDevice || !hSwapChain)
 	{
@@ -825,35 +820,35 @@ static PVRSRV_ERROR SwapToDCSystem(IMG_HANDLE hDevice,
 		return (PVRSRV_ERROR_INVALID_PARAMS);
 	}
 	
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
-
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
 	
 	FlushInternalVSyncQueue(psSwapChain);
-
 	
 	OMAPLFBFlip(psSwapChain, (unsigned long)psDevInfo->sFBInfo.sSysAddr.uiAddr);
 
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 
 	return (PVRSRV_OK);
 }
 
-OMAP_BOOL OMAPLFBVSyncIHandler(OMAPLFB_SWAPCHAIN *psSwapChain)
+static void OMAPLFBVSyncIHandler(struct work_struct *work)
 {
-	OMAP_BOOL bStatus = OMAP_FALSE;
+	OMAPLFB_DEVINFO *psDevInfo = container_of(work, OMAPLFB_DEVINFO, vsync_work);
 	OMAPLFB_VSYNC_FLIP_ITEM *psFlipItem;
+	OMAPLFB_SWAPCHAIN *psSwapChain;
 	unsigned long ulMaxIndex;
-	unsigned long ulLockFlags;
 
-	spin_lock_irqsave(psSwapChain->psSwapChainLock, ulLockFlags);
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
+
+	psSwapChain = psDevInfo->psSwapChain;
+	if (!psSwapChain || psSwapChain->bFlushCommands)
+		goto ExitUnlock;
 
 	psFlipItem = &psSwapChain->psVSyncFlips[psSwapChain->ulRemoveIndex];
 	ulMaxIndex = psSwapChain->ulBufferCount - 1;
-
-	if (psSwapChain->bFlushCommands)
-	{
-		goto ExitUnlock;
-	}
+	
+	/* VSync with the display here */
+	OMAPLFBWaitForVSync();
 
 	while(psFlipItem->bValid)
 	{	
@@ -893,30 +888,33 @@ OMAP_BOOL OMAPLFBVSyncIHandler(OMAPLFB_SWAPCHAIN *psSwapChain)
 			}
 			else
 			{
-				
-				break;
+				queue_work(psDevInfo->vsync_isr_wq, &psDevInfo->vsync_work);
+				goto ExitUnlock;	
 			}
 		}
 		else
 		{
 			
 			OMAPLFBFlip(psSwapChain, (unsigned long)psFlipItem->sSysAddr);
-			
-			
+						
 			psFlipItem->bFlipped = OMAP_TRUE;
-			
-			
-			break;
+
+			/* 
+			 * If the flip has been presented here then we need in the next
+			 * VSYNC execute the command complete, schedule another work
+			 */
+			queue_work(psDevInfo->vsync_isr_wq, &psDevInfo->vsync_work);
+
+			goto ExitUnlock;	
 		}
 		
 		
 		psFlipItem = &psSwapChain->psVSyncFlips[psSwapChain->ulRemoveIndex];
 	}
-		
-ExitUnlock:
-	spin_unlock_irqrestore(psSwapChain->psSwapChainLock, ulLockFlags);
 
-	return bStatus;
+ExitUnlock:
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
+
 }
 
 static IMG_BOOL ProcessFlip(IMG_HANDLE  hCmdCookie,
@@ -927,11 +925,15 @@ static IMG_BOOL ProcessFlip(IMG_HANDLE  hCmdCookie,
 	OMAPLFB_DEVINFO *psDevInfo;
 	OMAPLFB_BUFFER *psBuffer;
 	OMAPLFB_SWAPCHAIN *psSwapChain;
-
+#if defined(SYS_USING_INTERRUPTS)
+	OMAPLFB_VSYNC_FLIP_ITEM* psFlipItem;
+#endif
+	
 	if(!hCmdCookie || !pvData)
 	{
 		return IMG_FALSE;
 	}
+
 	
 	psFlipCmd = (DISPLAYCLASS_FLIP_COMMAND*)pvData;
 
@@ -939,73 +941,81 @@ static IMG_BOOL ProcessFlip(IMG_HANDLE  hCmdCookie,
 	{
 		return IMG_FALSE;
 	}
+
 	
 	psDevInfo = (OMAPLFB_DEVINFO*)psFlipCmd->hExtDevice;
 	
 	psBuffer = (OMAPLFB_BUFFER*)psFlipCmd->hExtBuffer;
 	psSwapChain = (OMAPLFB_SWAPCHAIN*) psFlipCmd->hExtSwapChain;
 
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
+	
 	if (psDevInfo->bDeviceSuspended)
 	{
 		psSwapChain->psPVRJTable->pfnPVRSRVCmdComplete(hCmdCookie, IMG_TRUE);
-		return IMG_TRUE;
+		goto ExitTrueUnlock;
 	}
 
-	mutex_lock(&psDevInfo->active_list_lock);
+#if defined(SYS_USING_INTERRUPTS)
+	
+	if(psFlipCmd->ui32SwapInterval == 0 || psSwapChain->bFlushCommands == OMAP_TRUE)
+	{
+#endif
+		
+		OMAPLFBFlip(psSwapChain, (unsigned long)psBuffer->sSysAddr.uiAddr);
 
-	if (!list_empty(&psBuffer->list)) {
-		pr_warning("omaplfb: this buffer's already on the list\n");
+		
 		psSwapChain->psPVRJTable->pfnPVRSRVCmdComplete(hCmdCookie, IMG_TRUE);
-	} else {
-		if (list_empty(&psDevInfo->active_list)) {
-			OMAPLFBFlip(psSwapChain,
-				    (unsigned long)psBuffer->sSysAddr.uiAddr);
-			psSwapChain->psPVRJTable->pfnPVRSRVCmdComplete(hCmdCookie, IMG_TRUE);
+
+#if defined(SYS_USING_INTERRUPTS)
+		goto ExitTrueUnlock;
+	}
+
+	psFlipItem = &psSwapChain->psVSyncFlips[psSwapChain->ulInsertIndex];
+
+	
+	if(psFlipItem->bValid == OMAP_FALSE)
+	{
+		unsigned long ulMaxIndex = psSwapChain->ulBufferCount - 1;
+		
+		if(psSwapChain->ulInsertIndex == psSwapChain->ulRemoveIndex)
+		{
+			/* If both indexes are equal the queue is empty, present immediatly */
+			OMAPLFBFlip(psSwapChain, (unsigned long)psBuffer->sSysAddr.uiAddr);
+
+			psFlipItem->bFlipped = OMAP_TRUE;
 		}
-		psBuffer->hCmdCookie = hCmdCookie;
+		else
+		{
+			psFlipItem->bFlipped = OMAP_FALSE;
+		}
 
-		list_add_tail(&psBuffer->list, &psDevInfo->active_list);
-		queue_work(psDevInfo->workq, &psDevInfo->active_work);
+		/* The buffer is queued here, must be consumed by the VSYNC workqueue */
+		psFlipItem->hCmdComplete = (OMAP_HANDLE)hCmdCookie;
+		psFlipItem->ulSwapInterval = (unsigned long)psFlipCmd->ui32SwapInterval;
+		psFlipItem->sSysAddr = &psBuffer->sSysAddr;
+		psFlipItem->bValid = OMAP_TRUE;
+
+		psSwapChain->ulInsertIndex++;
+		if(psSwapChain->ulInsertIndex > ulMaxIndex)
+		{
+			psSwapChain->ulInsertIndex = 0;
+		}
+
+		/* Give work to the workqueue to sync with the display */				
+		queue_work(psDevInfo->vsync_isr_wq, &psDevInfo->vsync_work);
+
+		goto ExitTrueUnlock;
 	}
+	
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 
-	mutex_unlock(&psDevInfo->active_list_lock);
+	return IMG_FALSE;
+#endif
 
+ExitTrueUnlock:
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 	return IMG_TRUE;
-}
-
-static void active_worker(struct work_struct *work)
-{
-	OMAPLFB_DEVINFO *psDevInfo =
-		container_of(work, OMAPLFB_DEVINFO, active_work);
-	OMAPLFB_SWAPCHAIN *psSwapChain = psDevInfo->psSwapChain;
-	OMAPLFB_BUFFER *psBuffer;
-
-	OMAPLFBSync();
-
-	mutex_lock(&psDevInfo->active_list_lock);
-	if (list_empty(&psDevInfo->active_list)) {
-		pr_warning("omaplfb: syncing with no active buffer\n");
-		mutex_unlock(&psDevInfo->active_list_lock);
-		return;
-	}
-
-	psBuffer = list_first_entry(&psDevInfo->active_list,
-				    OMAPLFB_BUFFER, list);
-
-	list_del_init(&psBuffer->list);
-
-	if (!list_empty(&psDevInfo->active_list)) {
-		psBuffer = list_first_entry(&psDevInfo->active_list,
-					    OMAPLFB_BUFFER, list);
-		OMAPLFBFlip(psSwapChain,
-			    (unsigned long)psBuffer->sSysAddr.uiAddr);
-
-		psSwapChain->psPVRJTable->
-			pfnPVRSRVCmdComplete(psBuffer->hCmdCookie, IMG_TRUE);
-
-		queue_work(psDevInfo->workq, &psDevInfo->active_work);
-	}
-	mutex_unlock(&psDevInfo->active_list_lock);
 }
 
 
@@ -1021,7 +1031,6 @@ static OMAP_ERROR InitDev(OMAPLFB_DEVINFO *psDevInfo)
 
 	if (fb_idx < 0 || fb_idx >= num_registered_fb)
 	{
-		pr_err("%d %d\n", fb_idx, num_registered_fb);
 		eError = OMAP_ERROR_INVALID_DEVICE;
 		goto errRelSem;
 	}
@@ -1132,15 +1141,9 @@ static OMAP_ERROR InitDev(OMAPLFB_DEVINFO *psDevInfo)
 		printk("Unknown FB format\n");
 	}
 
-
+	
 	psDevInfo->sFBInfo.sSysAddr.uiAddr = psPVRFBInfo->sSysAddr.uiAddr;
 	psDevInfo->sFBInfo.sCPUVAddr = psPVRFBInfo->sCPUVAddr;
-
-	mutex_init(&psDevInfo->active_list_lock);
-	INIT_LIST_HEAD(&psDevInfo->active_list);
-	INIT_WORK(&psDevInfo->active_work, active_worker);
-	psDevInfo->workq = create_workqueue("pvrflip");
-	OMAPLFBDisplayInit();
 
 	eError = OMAP_OK;
 	goto errRelSem;
@@ -1215,7 +1218,7 @@ OMAP_ERROR OMAPLFBInit(void)
 			return (OMAP_ERROR_INIT_FAILURE);
 		}
 
-		spin_lock_init(&psDevInfo->sSwapChainLock);
+		mutex_init(&psDevInfo->sSwapChainLockMutex);
 
 		psDevInfo->psSwapChain = 0;
 		psDevInfo->bFlushCommands = OMAP_FALSE;
@@ -1245,6 +1248,7 @@ OMAP_ERROR OMAPLFBInit(void)
 			": Maximum number of swap chain buffers: %lu\n",
 			psDevInfo->sDisplayInfo.ui32MaxSwapChainBuffers));
 
+		
 		psDevInfo->sSystemBuffer.sSysAddr = psDevInfo->sFBInfo.sSysAddr;
 		psDevInfo->sSystemBuffer.sCPUVAddr = psDevInfo->sFBInfo.sCPUVAddr;
 		psDevInfo->sSystemBuffer.ulBufferSize = psDevInfo->sFBInfo.ulRoundedBufferSize;
@@ -1277,8 +1281,7 @@ OMAP_ERROR OMAPLFBInit(void)
 		{
 			return (OMAP_ERROR_DEVICE_REGISTER_FAILED);
 		}
-		
-		
+
 		pfnCmdProcList[DC_FLIP_COMMAND] = ProcessFlip;
 
 		
@@ -1339,7 +1342,7 @@ OMAP_ERROR OMAPLFBDeinit(void)
 		{
 			return (OMAP_ERROR_GENERIC);
 		}
-		
+
 		DeInitDev(psDevInfo);
 
 		
@@ -1353,12 +1356,13 @@ OMAP_ERROR OMAPLFBDeinit(void)
 	return (OMAP_OK);
 }
 
+
+#if defined(LDM_PLATFORM)
 void OMAPLFBDriverSuspend(void)
 {
 	OMAPLFB_DEVINFO *psDevInfo = GetAnchorPtr();
-	unsigned long    ulLockFlags;
 
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
 
 	if (psDevInfo->bDeviceSuspended)
 	{
@@ -1369,25 +1373,30 @@ void OMAPLFBDriverSuspend(void)
 	
 	SetFlushStateInternalNoLock(psDevInfo, OMAP_TRUE);
 
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
+	
+	return;
+
 ExitUnlock:
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 }
 
 void OMAPLFBDriverResume(void)
 {
 	OMAPLFB_DEVINFO *psDevInfo = GetAnchorPtr();
-	unsigned long    ulLockFlags;
 
 	if (psDevInfo->bDeviceSuspended == OMAP_FALSE)
 	{
 		return;
 	}
 
-	spin_lock_irqsave(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_lock(&psDevInfo->sSwapChainLockMutex);
 	
 	SetFlushStateInternalNoLock(psDevInfo, OMAP_FALSE);
 
 	psDevInfo->bDeviceSuspended = OMAP_FALSE;
 
-	spin_unlock_irqrestore(&psDevInfo->sSwapChainLock, ulLockFlags);
+	mutex_unlock(&psDevInfo->sSwapChainLockMutex);
 }
+#endif
+
